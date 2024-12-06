@@ -1,0 +1,46 @@
+# 1장
+
+# 2장, Working with Text
+
+출처: https://github.com/rasbt/LLMs-from-scratch/blob/main/ch02/01_main-chapter-code/ch02.ipynb
+
+Packages that are being used in this notebook:
+```bash
+torch version: 2.4.0
+tiktoken version: 0.7.0
+```
+
+## Tokenizing text
+
+we tokenize text, which means breaking text into smaller units, such as individual words and punctuation characters
+
+- Load raw text we want to work with
+- The Verdict by Edith Wharton is a public domain short story
+
+
+```{python}
+import os
+import re
+import urllib.request
+
+if not os.path.exists("../../input/the-verdict.txt"):
+    url = ("https://raw.githubusercontent.com/rasbt/"
+           "LLMs-from-scratch/main/ch02/01_main-chapter-code/"
+           "the-verdict.txt")
+    file_path = "../../input/the-verdict.txt"
+    urllib.request.urlretrieve(url, file_path)
+
+with open("../../input/the-verdict.txt", "r", encoding="utf-8") as f:
+    raw_text = f.read()
+    
+print("Total number of character:", len(raw_text))
+print(raw_text[:99])
+```
+
+
+```{python}
+preprocessed = re.split(r'([,.:;?_!"()\']|--|\s)', raw_text)
+preprocessed = [item.strip() for item in preprocessed if item.strip()]
+print(preprocessed[:30])
+print(len(preprocessed))
+```

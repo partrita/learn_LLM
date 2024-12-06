@@ -1,0 +1,202 @@
+---
+
+---
+
+# Chapter2: Working with Text Data
+
+minimal pipeline.
+
+```{python}
+import tiktoken
+import torch
+from torch.utils.data import Dataset, DataLoader
+from typing import List, Tuple, Optional
+
+class GPTDatasetV1(Dataset):
+    def __init__(self, txt: str, tokenizer: tiktoken.Encoding, max_length: int, stride: int):
+        self.input_ids: List[torch.Tensor] = []
+        self.target_ids: List[torch.Tensor] = []
+
+        # 전체 텍스트 토큰화
+        token_ids: List[int] = tokenizer.encode(txt, allowed_special={"<|endoftext|>"})
+
+        # 슬라이딩 윈도우를 사용하여 책을 겹치는 max_length 시퀀스로 분할
+        for i in range(0, len(token_ids) - max_length, stride):
+            input_chunk = token_ids[i:i + max_length]
+            target_chunk = token_ids[i + 1: i + max_length + 1]
+            self.input_ids.append(torch.tensor(input_chunk))
+            self.target_ids.append(torch.tensor(target_chunk))
+
+    def __len__(self) -> int:
+        return len(self.input_ids)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.input_ids[idx], self.target_ids[idx]
+
+
+def create_dataloader_v1(txt: str, batch_size: int = 4, max_length: int = 256, 
+                         stride: int = 128, shuffle: bool = True, 
+                         drop_last: bool = True, num_workers: int = 0) -> DataLoader:
+    # 토크나이저 초기화
+    tokenizer: tiktoken.Encoding = tiktoken.get_encoding("gpt2")
+
+    # 데이터셋 생성
+    dataset: GPTDatasetV1 = GPTDatasetV1(txt, tokenizer, max_length, stride)
+
+    # 데이터로더 생성
+    dataloader: DataLoader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=shuffle, 
+        drop_last=drop_last, num_workers=num_workers)
+
+    return dataloader
+
+
+# 파일에서 텍스트 읽기
+with open("../../input/the-verdict.txt", "r", encoding="utf-8") as f:
+    raw_text: str = f.read()
+
+tokenizer: tiktoken.Encoding = tiktoken.get_encoding("gpt2")
+encoded_text: List[int] = tokenizer.encode(raw_text)
+
+vocab_size: int = 50257
+output_dim: int = 256
+context_length: int = 1024
+
+# 임베딩 레이어 초기화
+token_embedding_layer: torch.nn.Embedding = torch.nn.Embedding(vocab_size, output_dim)
+pos_embedding_layer: torch.nn.Embedding = torch.nn.Embedding(context_length, output_dim)
+
+max_length: int = 4
+dataloader: DataLoader = create_dataloader_v1(raw_text, batch_size=8, max_length=max_length, stride=max_length)
+
+for batch in dataloader:
+    x: torch.Tensor
+    y: torch.Tensor
+    x, y = batch
+
+    token_embeddings: torch.Tensor = token_embedding_layer(x)
+    pos_embeddings: torch.Tensor = pos_embedding_layer(torch.arange(max_length))
+
+    input_embeddings: torch.Tensor = token_embeddings + pos_embeddings
+
+    break
+
+print(input_embeddings.shape)
+```
+
+
+## BytePair encoding
+
+```{python}
+tokenizer = tiktoken.get_encoding("gpt2")
+
+text = ( "Hello, do you like tea? <|endoftext|> In the sunlit terraces" "of someunknownPlace." )
+
+integers = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
+strings = tokenizer.decode(integers) 
+print(strings)
+```
+
+## Data sampling with a sliding window
+
+```{python}
+import torch
+import tiktoken
+from torch.utils.data import Dataset, DataLoader
+from typing import List, Tuple, Optional
+
+# 파일에서 텍스트 읽기
+with open("../../input/the-verdict.txt", "r", encoding="utf-8") as f:
+    raw_text: str = f.read()
+
+class GPTDatasetV1(Dataset):
+    def __init__(self, txt: str, tokenizer: tiktoken.Encoding, max_length: int, stride: int):
+        self.input_ids: List[torch.Tensor] = []
+        self.target_ids: List[torch.Tensor] = []
+
+        # 전체 텍스트를 토큰화
+        token_ids: List[int] = tokenizer.encode(txt, allowed_special={"<|endoftext|>"})
+
+        # 슬라이딩 윈도우를 사용하여 책을 max_length 길이의 겹치는 시퀀스로 분할
+        for i in range(0, len(token_ids) - max_length, stride):
+            input_chunk = token_ids[i:i + max_length]
+            target_chunk = token_ids[i + 1: i + max_length + 1]
+            self.input_ids.append(torch.tensor(input_chunk))
+            self.target_ids.append(torch.tensor(target_chunk))
+
+    def __len__(self) -> int:
+        return len(self.input_ids)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.input_ids[idx], self.target_ids[idx]
+
+def create_dataloader_v1(txt: str, 
+                         batch_size: int = 4, 
+                         max_length: int = 256, 
+                         stride: int = 128, 
+                         shuffle: bool = True, 
+                         drop_last: bool = True,
+                         num_workers: int = 0) -> DataLoader:
+
+    # 토크나이저 초기화
+    tokenizer: tiktoken.Encoding = tiktoken.get_encoding("gpt2")
+
+    # 데이터셋 생성
+    dataset: GPTDatasetV1 = GPTDatasetV1(txt, tokenizer, max_length, stride)
+
+    # 데이터로더 생성
+    dataloader: DataLoader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        num_workers=num_workers
+    )
+
+    return dataloader
+
+# raw_text가 이전에 어딘가에서 정의되었다고 가정
+dataloader: DataLoader = create_dataloader_v1(raw_text, batch_size=8, max_length=4, stride=4, shuffle=False)
+
+data_iter: iter = iter(dataloader)
+inputs: torch.Tensor
+targets: torch.Tensor
+inputs, targets = next(data_iter)
+print("입력:\n", inputs)
+print("\n목표:\n", targets)
+```
+
+
+```{python}
+from typing import Iterator, Tuple
+
+max_length: int = 4
+dataloader: DataLoader = create_dataloader_v1(
+    raw_text, 
+    batch_size=8, 
+    max_length=max_length,
+    stride=max_length, 
+    shuffle=False
+)
+
+data_iter: Iterator[Tuple[torch.Tensor, torch.Tensor]] = iter(dataloader)
+inputs: torch.Tensor
+targets: torch.Tensor
+inputs, targets = next(data_iter)
+
+token_embeddings: torch.Tensor = token_embedding_layer(inputs)
+print(f"Token embeddings shape: {token_embeddings.shape}")
+
+# GPT-2는 절대 위치 임베딩을 사용하므로, 단순히 또 다른 임베딩 레이어를 생성합니다
+context_length: int = max_length
+pos_embedding_layer: torch.nn.Embedding = torch.nn.Embedding(context_length, output_dim)
+pos_embeddings: torch.Tensor = pos_embedding_layer(torch.arange(max_length))
+print(f"위치 임베딩 형태: {pos_embeddings.shape}")
+
+# LLM에서 사용되는 입력 임베딩을 생성하기 위해, 단순히 토큰 임베딩과 위치 임베딩을 더합니다
+input_embeddings: torch.Tensor = token_embeddings + pos_embeddings
+print(f"입력 임베딩 형태: {input_embeddings.shape}")
+
+# 입력 처리 워크플로우의 초기 단계에서, 입력 텍스트는 개별 토큰으로 분할됩니다
+# 이 분할 이후, 이 토큰들은 미리 정의된 어휘를 기반으로 토큰 ID로 변환됩니다
+```

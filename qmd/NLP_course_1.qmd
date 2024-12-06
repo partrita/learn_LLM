@@ -1,0 +1,14 @@
+# 초기 설정
+
+# 트랜스포머 모델
+
+## 자연어 처리
+
+## 트랜스포머로 할 수 있는 일?
+
+```{python}
+from transformers import pipeline
+
+classifier = pipeline("sentiment-analysis")
+
+```
