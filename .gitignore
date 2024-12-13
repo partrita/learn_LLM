@@ -174,3 +174,5 @@ pytest-temp
 target-pixi
 codeparrot-ds/
 marian-finetuned-kde4-en-to-fr/
+chkpt/
+output/

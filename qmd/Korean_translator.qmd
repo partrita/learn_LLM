@@ -1,0 +1,615 @@
+---
+title: "A Gentle Introduction to Creating an English-to-Korean translator with Transformers"
+author: "Jo, Joonu (metamath@gmail.com)"
+date: "2023-02-27"
+image: translate.png
+categories: [ai, T5, transformers, hugging face, 번역기, 한국어 번역기]
+---
+
+# 친절한 영어-한국어 번역기 만들기 A Gentle Introduction to Creating an English-to-Korean translator with Transformers
+
+```{python}
+import pandas as pd
+from datasets import load_dataset
+
+en_ko = load_dataset("bongsoo/news_talk_en_ko")
+# 허깅페이스 데이터셋을 판다스 포맷으로 세팅
+en_ko.set_format(type="pandas")
+# 'train'키의 모든 행을 DataFrame df에 할당
+df = en_ko["train"][:]
+
+# 잘 담겼는지 확인한다.
+df.head()
+```
+
+
+```{python}
+from datasets import Dataset, DatasetDict
+
+# Rename columns and create a new DataFrame with original column names in one step
+df.columns = ['en', 'ko']
+en_ko_df = pd.concat([pd.DataFrame([df.columns], columns=df.columns), df], ignore_index=True)
+en_ko_df.head()
+
+# Define sample sizes
+sample_sizes = {
+    "train": 1_200_000,
+    "valid": 90_000,
+    "test": 10_000
+}
+
+# Create DatasetDict directly from pandas DataFrame
+dataset = DatasetDict({
+    "train": Dataset.from_pandas(en_ko_df.iloc[:sample_sizes["train"]]),
+    "valid": Dataset.from_pandas(en_ko_df.iloc[sample_sizes["train"]:sample_sizes["train"]+sample_sizes["valid"]]),
+    "test": Dataset.from_pandas(en_ko_df.iloc[-sample_sizes["test"]:])
+})
+```
+
+```{python}
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import DataCollatorForSeq2Seq
+from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
+from evaluate import load as load_metric
+import numpy as np
+import torch
+import multiprocessing
+import evaluate
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+model_ckpt = "KETI-AIR/ke-t5-base"
+max_token_length = 64
+
+tokenizer = AutoTokenizer.from_pretrained(model_ckpt)
+
+def convert_examples_to_features(examples):
+    model_inputs = tokenizer(
+        examples['en'],
+        text_target=examples['ko'],
+        max_length=max_token_length,
+        truncation=True,
+        )
+    return model_inputs
+
+NUM_CPU = multiprocessing.cpu_count()
+
+tokenized_datasets = dataset.map(
+    convert_examples_to_features,
+    batched=True,
+    # 이걸 쓰지 않으면 원 데이터 'en', 'ko'가 남아서
+    # 아래서 콜레이터가 패딩을 못해서 에러남
+    remove_columns=dataset["train"].column_names,
+    num_proc=NUM_CPU,
+    )
+
+model = AutoModelForSeq2SeqLM.from_pretrained(model_ckpt).to(device)
+
+# decoder_inputs = model._shift_right(decoder_targets)
+
+# forward pass
+# outputs = model(input_ids=encoder_inputs,
+#                 decoder_input_ids=decoder_inputs,
+#                 labels=decoder_targets)
+
+data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+
+
+metric = evaluate.load("sacrebleu")
+
+def compute_metrics(eval_preds):
+    preds, labels = eval_preds
+
+    if isinstance(preds, tuple):
+        preds = preds[0]
+
+    decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+
+    # Replace -100 in the labels as we can't decode them.
+    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    # Some simple post-processing
+    decoded_preds = [pred.strip() for pred in decoded_preds]
+    decoded_labels = [[label.strip()] for label in decoded_labels]
+
+    result = metric.compute(predictions=decoded_preds, references=decoded_labels)
+    result = {"bleu": result["score"]}
+
+    return result
+    
+```
+
+
+# 학습하기
+
+```{python}
+training_args = Seq2SeqTrainingArguments(
+    output_dir="chkpt",
+    learning_rate=0.0005,
+    weight_decay=0.01,
+    per_device_train_batch_size=64,
+    per_device_eval_batch_size=128,
+    num_train_epochs=1,
+    save_steps=500,
+    save_total_limit=2,
+    evaluation_strategy="epoch",
+    logging_strategy="no",
+    predict_with_generate=True,
+    fp16=False,
+    gradient_accumulation_steps=2,
+    report_to="none" # Wandb 로그 끄기
+)
+
+trainer = Seq2SeqTrainer(
+    model,
+    training_args,
+    train_dataset=tokenized_datasets["train"],
+    eval_dataset=tokenized_datasets["valid"],
+    data_collator=data_collator,
+    tokenizer=tokenizer,
+    compute_metrics=compute_metrics,
+)
+
+trainer.train()
+
+trainer.save_model("../output/results")
+```
+
+# 테스트하기
+
+```{python}
+from torch.utils.data import DataLoader
+from transformers import DataCollatorForSeq2Seq
+
+model_dir = "../output/results"
+tokenizer = AutoTokenizer.from_pretrained(model_dir)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_dir)
+
+model.cpu()
+
+
+data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+
+test_dataloader = DataLoader(
+    tokenized_datasets["test"], batch_size=32, collate_fn=data_collator
+)
+
+test_dataloader_iter = iter(test_dataloader)
+test_batch = next(test_dataloader_iter)
+
+test_input = { key: test_batch[key] for key in ('input_ids', 'attention_mask') }
+
+
+koreans = model.generate(
+    **test_input,
+    max_length=max_token_length,
+    num_beams=5,
+)
+
+labels =  np.where(test_batch.labels != -100, test_batch.labels, tokenizer.pad_token_id)
+eng_sents = tokenizer.batch_decode(test_batch.input_ids, skip_special_tokens=True)[10:20]
+references = tokenizer.batch_decode(labels, skip_special_tokens=True)[10:20]
+preds = tokenizer.batch_decode( koreans, skip_special_tokens=True )[10:20]
+for s in zip(eng_sents, references, preds):
+    print('English   :', s[0])
+    print('Reference :', s[1])
+    print('Translated:', s[2])
+    print('\n')
+```
+
+# 리팩토링 코드
+
+```{python}
+import pandas as pd
+from datasets import load_dataset, Dataset, DatasetDict
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, DataCollatorForSeq2Seq, Seq2SeqTrainingArguments, Seq2SeqTrainer
+import evaluate
+import numpy as np
+import torch
+import multiprocessing
+from typing import Dict, List, Tuple, Any
+
+# 디바이스 설정
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# 모델 및 토크나이저 설정
+model_ckpt: str = "KETI-AIR/ke-t5-base"
+max_token_length: int = 64
+
+def load_and_prepare_data() -> DatasetDict:
+    """데이터를 로드하고 준비하는 함수"""
+    # 데이터셋 로드
+    en_ko = load_dataset("bongsoo/news_talk_en_ko")
+    en_ko.set_format(type="pandas")
+    df = en_ko["train"][:]
+
+    # 컬럼 이름 변경 및 원본 컬럼 이름을 포함한 새 DataFrame 생성
+    df.columns = ['en', 'ko']
+    en_ko_df = pd.concat([pd.DataFrame([df.columns], columns=df.columns), df], ignore_index=True)
+
+    # 샘플 크기 정의
+    sample_sizes: Dict[str, int] = {
+        "train": 1_200_000,
+        "valid": 90_000,
+        "test": 10_000
+    }
+
+    # pandas DataFrame에서 직접 DatasetDict 생성
+    dataset = DatasetDict({
+        "train": Dataset.from_pandas(en_ko_df.iloc[:sample_sizes["train"]]),
+        "valid": Dataset.from_pandas(en_ko_df.iloc[sample_sizes["train"]:sample_sizes["train"]+sample_sizes["valid"]]),
+        "test": Dataset.from_pandas(en_ko_df.iloc[-sample_sizes["test"]:])
+    })
+
+    return dataset
+
+def tokenize_data(dataset: DatasetDict, tokenizer: AutoTokenizer) -> DatasetDict:
+    """데이터를 토큰화하는 함수"""
+    def convert_examples_to_features(examples: Dict[str, List[str]]) -> Dict[str, List[int]]:
+        return tokenizer(
+            examples['en'],
+            text_target=examples['ko'],
+            max_length=max_token_length,
+            truncation=True,
+        )
+
+    NUM_CPU = multiprocessing.cpu_count()
+
+    return dataset.map(
+        convert_examples_to_features,
+        batched=True,
+        remove_columns=dataset["train"].column_names,
+        num_proc=NUM_CPU,
+    )
+
+def compute_metrics(eval_preds: Tuple[np.ndarray, np.ndarray]) -> Dict[str, float]:
+    """평가 메트릭을 계산하는 함수"""
+    preds, labels = eval_preds
+    if isinstance(preds, tuple):
+        preds = preds[0]
+
+    decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    decoded_preds = [pred.strip() for pred in decoded_preds]
+    decoded_labels = [[label.strip()] for label in decoded_labels]
+
+    metric = evaluate.load("sacrebleu")
+    result = metric.compute(predictions=decoded_preds, references=decoded_labels)
+    return {"bleu": result["score"]}
+
+def train_model(tokenized_datasets: DatasetDict, model: AutoModelForSeq2SeqLM, tokenizer: AutoTokenizer) -> None:
+    """모델을 학습하는 함수"""
+    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+
+    training_args = Seq2SeqTrainingArguments(
+        output_dir="chkpt",
+        learning_rate=0.0005,
+        weight_decay=0.01,
+        per_device_train_batch_size=64,
+        per_device_eval_batch_size=128,
+        num_train_epochs=4,
+        save_steps=500,
+        save_total_limit=2,
+        evaluation_strategy="epoch",
+        logging_strategy="no",
+        predict_with_generate=True,
+        fp16=False,
+        gradient_accumulation_steps=2,
+        report_to="none"
+    )
+
+    trainer = Seq2SeqTrainer(
+        model,
+        training_args,
+        train_dataset=tokenized_datasets["train"],
+        eval_dataset=tokenized_datasets["valid"],
+        data_collator=data_collator,
+        tokenizer=tokenizer,
+        compute_metrics=compute_metrics,
+    )
+
+    trainer.train()
+    trainer.save_model("../output/results")
+
+def test_model(tokenized_datasets: DatasetDict, model: AutoModelForSeq2SeqLM, tokenizer: AutoTokenizer) -> None:
+    """모델을 테스트하는 함수"""
+    from torch.utils.data import DataLoader
+
+    model_dir = "../output/results"
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_dir)
+    model.cpu()
+
+    test_dataloader = DataLoader(
+        tokenized_datasets["test"], batch_size=32, collate_fn=DataCollatorForSeq2Seq(tokenizer, model=model)
+    )
+
+    test_batch = next(iter(test_dataloader))
+    test_input = {key: test_batch[key] for key in ('input_ids', 'attention_mask')}
+
+    koreans = model.generate(
+        **test_input,
+        max_length=max_token_length,
+        num_beams=5,
+    )
+
+    labels = np.where(test_batch.labels != -100, test_batch.labels, tokenizer.pad_token_id)
+    eng_sents = tokenizer.batch_decode(test_batch.input_ids, skip_special_tokens=True)[10:20]
+    references = tokenizer.batch_decode(labels, skip_special_tokens=True)[10:20]
+    preds = tokenizer.batch_decode(koreans, skip_special_tokens=True)[10:20]
+
+    for eng, ref, pred in zip(eng_sents, references, preds):
+        print('English   :', eng)
+        print('Reference :', ref)
+        print('Translated:', pred)
+        print('\n')
+
+# 데이터 로드 및 준비
+dataset = load_and_prepare_data()
+
+# 토크나이저 초기화
+tokenizer = AutoTokenizer.from_pretrained(model_ckpt)
+
+# 데이터 토큰화
+tokenized_datasets = tokenize_data(dataset, tokenizer)
+
+# 모델 초기화
+model = AutoModelForSeq2SeqLM.from_pretrained(model_ckpt).to(device)
+
+# 모델 학습
+train_model(tokenized_datasets, model, tokenizer)
+
+# 모델 테스트
+test_model(tokenized_datasets, model, tokenizer)
+```
+
+## 다른 모델 사용하기
+
+아래 코드의 모델은 제대로 작동하지 않는다.
+
+```{python}
+# 모델 및 토크나이저 설정
+model_ckpt: str = "google/flan-t5-small"
+max_token_length: int = 512  # flan-t5-small의 최대 입력 길이
+
+# 토크나이저 초기화
+tokenizer = AutoTokenizer.from_pretrained(model_ckpt)
+
+# 모델 초기화
+model = AutoModelForSeq2SeqLM.from_pretrained(model_ckpt).to(device)
+```
+
+
+```{python}
+import pandas as pd
+import numpy as np
+import torch
+import multiprocessing
+from typing import Dict, List, Tuple, Any
+from datasets import load_dataset, Dataset, DatasetDict
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    DataCollatorForSeq2Seq,
+    Seq2SeqTrainingArguments,
+    Seq2SeqTrainer,
+)
+import evaluate
+
+# Device configuration
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# Model configuration
+MODEL_CKPT: str = "google/flan-t5-small"
+MAX_TOKEN_LENGTH: int = 512  # Maximum input length for flan-t5-small
+
+class DataPreparation:
+    """Class for loading and preparing dataset."""
+    
+    @staticmethod
+    def load_and_prepare_data() -> DatasetDict:
+        """Load and prepare the dataset."""
+        en_ko = load_dataset("bongsoo/news_talk_en_ko")
+        en_ko.set_format(type="pandas")
+        df = en_ko["train"][:]
+        df.columns = ['en', 'ko']
+
+        # Sample sizes definition
+        sample_sizes: Dict[str, int] = {
+            "train": 1_200_000,
+            "valid": 90_000,
+            "test": 10_000
+        }
+
+        # Create DatasetDict from pandas DataFrame
+        dataset = DatasetDict({
+            "train": Dataset.from_pandas(df.iloc[:sample_sizes["train"]]),
+            "valid": Dataset.from_pandas(df.iloc[sample_sizes["train"]:sample_sizes["train"] + sample_sizes["valid"]]),
+            "test": Dataset.from_pandas(df.iloc[-sample_sizes["test"]:])
+        })
+
+        return dataset
+
+class Tokenization:
+    """Class for tokenizing datasets."""
+    
+    @staticmethod
+    def tokenize_data(dataset: DatasetDict, tokenizer: AutoTokenizer) -> DatasetDict:
+        """Tokenize the dataset."""
+        
+        def convert_examples_to_features(examples: Dict[str, List[str]]) -> Dict[str, List[int]]:
+            return tokenizer(
+                examples['en'],
+                text_target=examples['ko'],
+                max_length=MAX_TOKEN_LENGTH,
+                truncation=True,
+            )
+
+        num_cpu = multiprocessing.cpu_count()
+        
+        return dataset.map(
+            convert_examples_to_features,
+            batched=True,
+            remove_columns=dataset["train"].column_names,
+            num_proc=num_cpu,
+        )
+
+class ModelTraining:
+    """Class for training the model."""
+    
+    @staticmethod
+    def compute_metrics(eval_preds: Tuple[np.ndarray, np.ndarray]) -> Dict[str, float]:
+        """Compute evaluation metrics."""
+        preds, labels = eval_preds
+        if isinstance(preds, tuple):
+            preds = preds[0]
+
+        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+        decoded_preds = [pred.strip() for pred in decoded_preds]
+        decoded_labels = [[label.strip()] for label in decoded_labels]
+
+        metric = evaluate.load("sacrebleu")
+        result = metric.compute(predictions=decoded_preds, references=decoded_labels)
+        
+        return {"bleu": result["score"]}
+
+    @staticmethod
+    def train_model(tokenized_datasets: DatasetDict, model: AutoModelForSeq2SeqLM, tokenizer: AutoTokenizer) -> None:
+        """Train the model."""
+        
+        data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+
+        training_args = Seq2SeqTrainingArguments(
+            output_dir="chkpt",
+            learning_rate=0.0005,
+            weight_decay=0.01,
+            per_device_train_batch_size=64,
+            per_device_eval_batch_size=128,
+            num_train_epochs=1,
+            save_steps=500,
+            save_total_limit=2,
+            evaluation_strategy="epoch",
+            logging_strategy="no",
+            predict_with_generate=True,
+            fp16=False,
+            gradient_accumulation_steps=2,
+            report_to="none"
+        )
+
+        trainer = Seq2SeqTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=tokenized_datasets["train"],
+            eval_dataset=tokenized_datasets["valid"],
+            data_collator=data_collator,
+            tokenizer=tokenizer,
+            compute_metrics=ModelTraining.compute_metrics,
+        )
+
+        trainer.train()
+        trainer.save_model("../output/results")
+
+class ModelTesting:
+    """Class for testing the model."""
+    
+    @staticmethod
+    def test_model(tokenized_datasets: DatasetDict, model: AutoModelForSeq2SeqLM, tokenizer: AutoTokenizer) -> None:
+        """Test the model."""
+        
+        from torch.utils.data import DataLoader
+        
+        model_dir = "../output/results"
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_dir).to(device)
+
+        test_dataloader = DataLoader(
+            tokenized_datasets["test"], batch_size=32, collate_fn=DataCollatorForSeq2Seq(tokenizer, model=model)
+        )
+
+        test_batch = next(iter(test_dataloader))
+        
+        test_input = {key: test_batch[key].to(device) for key in ('input_ids', 'attention_mask')}
+        
+        koreans = model.generate(
+            **test_input,
+            max_length=MAX_TOKEN_LENGTH,
+            num_beams=5,
+        )
+
+        labels = np.where(test_batch.labels != -100, test_batch.labels, tokenizer.pad_token_id)
+        
+        eng_sents = tokenizer.batch_decode(test_batch.input_ids, skip_special_tokens=True)[10:20]
+        references = tokenizer.batch_decode(labels, skip_special_tokens=True)[10:20]
+        preds = tokenizer.batch_decode(koreans, skip_special_tokens=True)[10:20]
+
+        for eng, ref, pred in zip(eng_sents, references, preds):
+            print('English   :', eng)
+            print('Reference :', ref)
+            print('Translated:', pred)
+            print('\n')
+
+# Main execution flow
+# Load and prepare data
+dataset_preparer = DataPreparation()
+dataset = dataset_preparer.load_and_prepare_data()
+
+# Initialize tokenizer
+tokenizer = AutoTokenizer.from_pretrained(MODEL_CKPT)
+
+# Tokenize data
+tokenization_handler = Tokenization()
+tokenized_datasets = tokenization_handler.tokenize_data(dataset, tokenizer)
+
+# Initialize model
+model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_CKPT).to(device)
+
+# Train the model
+training_handler = ModelTraining()
+training_handler.train_model(tokenized_datasets, model, tokenizer)
+
+# Test the model
+testing_handler = ModelTesting()
+testing_handler.test_model(tokenized_datasets, model, tokenizer)
+```
+
+## huggingface에 모델 업로드하기
+
+```{python}
+import os
+from dotenv import load_dotenv
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from huggingface_hub import login
+
+# .env 파일 경로 지정
+env_path = "../.env"  # .env 파일의 절대 경로나 상대 경로를 입력하세요
+load_dotenv(dotenv_path=env_path)
+
+# 모델 및 토크나이저 로드
+model_dir = "../output/results"
+tokenizer = AutoTokenizer.from_pretrained(model_dir)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_dir)
+
+# .env 파일에서 Hugging Face 계정 정보 가져오기
+huggingface_username = os.getenv("HUGGINGFACE_USERNAME")
+repo_name = os.getenv("REPO_NAME")
+auth_token = os.getenv("HUGGINGFACE_AUTH_TOKEN")
+
+# 환경 변수가 제대로 설정되었는지 확인
+if not all([huggingface_username, repo_name, auth_token]):
+    raise ValueError("모든 필요한 환경 변수가 .env 파일에 설정되어 있지 않습니다.")
+
+# Hugging Face CLI 로그인
+login(auth_token)
+
+# 모델과 토크나이저를 Hub에 업로드
+tokenizer.push_to_hub(repo_name, use_auth_token=auth_token)
+model.push_to_hub(repo_name, use_auth_token=auth_token)
+
+print(f"모델이 성공적으로 Hugging Face Hub에 업로드되었습니다: https://huggingface.co/{huggingface_username}/{repo_name}")
+```
